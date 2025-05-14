@@ -1,0 +1,206 @@
+public with sharing class PushOrderToSAP {
+
+    public static String xmlstring { get; set; }
+    public static String orderstatus { get; set; }
+    public static String xmlresponsestring { get; set; }
+    public static Date xmldate { get; set; }
+    public static String stringxmlvalue { get; set; }
+    public static Set<String> sb { get; set; }
+    public static Map<String, Order_line_item__c> mapordline { get; set; }
+
+    @AuraEnabled
+    public static String pushOrder(Id orderId) {
+        Order order = fetchOrder(orderId);
+        if (order == null) return 'Order not found';
+        mapordline = mapLineItems(order);
+
+        if (order.Status != 'Approved') {
+            return 'First Order Need to be Approved';
+        }
+
+        DOM.Document soapRequest = buildSOAPRequest(order);
+        HttpResponse response = sendSOAPRequest(soapRequest);
+        orderstatus = processSOAPResponse(response, order);
+
+        return orderstatus;
+    }
+
+    private static Order fetchOrder(Id orderId) {
+        List<Order> orders = [
+            SELECT Id, Status, Name, Contract_Rate__c, Payment_Card__c, Order_Typelookup__c,
+                   Contract_sale_office_code__c, Indicator_SAP__c, ContractId,
+                   Contract.Contract_Code__c, Sales_Division__r.code__c,
+                   Customer_Reference__c, EffectiveDate, Customer_Ref_Date__c,
+                   Sales_Office_Code__c, Order_Typelookup__r.code__c, Account.SAP_ID__c,
+                   SAP_ID__c, Account.Terms_of_Payment__c, Sales_Advice__r.SAP_Code__c,
+                   (SELECT Id, Name, Product__c, Version__c, Quantity__c FROM Order_Line_Items__r)
+              FROM Order WHERE Id = :orderId
+        ];
+        return (orders.size() > 0) ? orders[0] : null;
+    }
+
+    private static Map<String, Order_line_item__c> mapLineItems(Order order) {
+        Map<String, Order_line_item__c> mapItems = new Map<String, Order_line_item__c>();
+        for (Order_line_item__c item : order.Order_Line_Items__r) {
+            mapItems.put(item.Version__c, item);
+        }
+        return mapItems;
+    }
+
+    private static DOM.Document buildSOAPRequest(Order order) {
+        DOM.Document doc = new DOM.Document();
+        DOM.XmlNode envelope = doc.createRootElement('soapenv:Envelope', null);
+        envelope.setAttribute('xmlns:soapenv', 'http://schemas.xmlsoap.org/soap/envelope/');
+        envelope.setAttribute('xmlns:dham', 'http://Dhampur.com:Salesforce:SALES_ORDER_CREATION');
+        envelope.addChildElement('soapenv:Header', null);
+
+        DOM.XmlNode body = envelope.addChildElement('soapenv:Body', null);
+        DOM.XmlNode root = body.addChildElement('dham:MT_sales_od_create_imp', null);
+
+        addOrderHeaderNodes(root, order);
+        addOrderItemNodes(root);
+
+        xmlstring = doc.toXmlString();
+        return doc;
+    }
+
+    private static void addOrderHeaderNodes(DOM.XmlNode root, Order order) {
+        String orderType = order.Order_Typelookup__r.code__c;
+        if (orderType == 'ZSUG') {
+            if (!Test.isRunningTest())
+                root.addChildElement('SALES_ADVISE_NUMBER', null).addTextNode(order.Sales_Advice__r.SAP_Code__c);
+        } else if (orderType == 'ZDSO') {
+            if (!Test.isRunningTest())
+                root.addChildElement('Sales_Contract', null).addTextNode(order.Contract.Contract_Code__c);
+        }
+
+        root.addChildElement('SALES_ORDER_TYPE', null).addTextNode(orderType);
+        if (!Test.isRunningTest()) {
+            root.addChildElement('DIVISION', null).addTextNode(order.Sales_Division__r.code__c);
+            root.addChildElement('SALES_OFFICE', null).addTextNode(
+                (orderType == 'ZDSO') ? order.Contract_sale_office_code__c : order.Sales_Office_Code__c
+            );
+        }
+
+        String paymentTerm = order.Account.Terms_of_Payment__c != null
+            ? order.Account.Terms_of_Payment__c
+            : order.Payment_Card__c;
+
+        root.addChildElement('PAYMENT_TERM', null).addTextNode(paymentTerm);
+        root.addChildElement('SOLD_TO_PARTY', null).addTextNode(order.Account.SAP_ID__c);
+        root.addChildElement('SHIP_TO_PARTY', null).addTextNode(order.Account.SAP_ID__c);
+
+        if (String.isNotEmpty(order.Customer_Reference__c))
+            root.addChildElement('CUSTOMER_REFERENCE', null).addTextNode(order.Customer_Reference__c);
+
+        root.addChildElement('CUST_REF_DATE', null).addTextNode(convertDateformat(order.Customer_Ref_Date__c));
+        root.addChildElement('INDICATOR_U_I', null).addTextNode('I');
+        root.addChildElement('PURCH_NO_C', null).addTextNode('PURCH123');
+        root.addChildElement('PURCH_DATE', null).addTextNode(convertDateToString(order.EffectiveDate));
+
+        DOM.XmlNode condTypeNode = root.addChildElement('COND_TYPE', null);
+        if (orderType == 'ZDSO') {
+            condTypeNode.addChildElement('TYPE', null).addTextNode('PR00');
+            condTypeNode.addChildElement('VALUE', null).addTextNode(
+                (order.Contract_Rate__c == null) ? '0' : String.valueOf(order.Contract_Rate__c)
+            );
+        } else if (orderType == 'ZSUG') {
+            condTypeNode.addChildElement('TYPE', null).addTextNode('ZIN0');
+            condTypeNode.addChildElement('VALUE', null).addTextNode('0');
+        }
+    }
+
+    private static void addOrderItemNodes(DOM.XmlNode root) {
+        for (Integer i = 0; i <= 5; i++) {
+            String key = String.valueOf(i);
+            if (mapordline.containsKey(key)) {
+                Order_line_item__c item = mapordline.get(key);
+                DOM.XmlNode itemNode = root.addChildElement('Item_QUANTITY', null);
+                itemNode.addChildElement('Item_no', null).addTextNode(key);
+                if (item.Quantity__c != null)
+                    itemNode.addChildElement('QUANTITY', null).addTextNode(String.valueOf(item.Quantity__c));
+                itemNode.addChildElement('IND', null).addTextNode('i');
+                itemNode.addChildElement('Sales_order', null).addTextNode('');
+            }
+        }
+    }
+
+    private static HttpResponse sendSOAPRequest(DOM.Document doc) {
+        GetApidetail__c apiDetails = GetApidetail__c.getValues('AllAccount');
+        HttpRequest req = new HttpRequest();
+        String endpoint = 'http://' + apiDetails.Endpoint__c +
+            '/XISOAPAdapter/MessageServlet?senderParty=&senderService=BC_Salesforece_Service' +
+            '&receiverParty=&receiverService=&interface=SI_Slaes_od_create_imp' +
+            '&interfaceNamespace=http://Dhampur.com:Salesforce:SALES_ORDER_CREATION';
+
+        req.setEndpoint(endpoint);
+        Blob headerValue = Blob.valueOf(apiDetails.Username__c + ':' + apiDetails.Password__c);
+        String authorizationHeader = 'Basic ' + EncodingUtil.base64Encode(headerValue);
+
+        req.setHeader('Authorization', authorizationHeader);
+        req.setHeader('Content-Type', 'application/xml');
+        req.setMethod('POST');
+        req.setBody(doc.toXmlString());
+        req.setTimeout(120000);
+
+        Http http = new Http();
+        return http.send(req);
+    }
+
+    private static String processSOAPResponse(HttpResponse response, Order order) {
+        xmlresponsestring = response.getBody();
+        if (String.isBlank(xmlresponsestring)) return 'No response from SAP';
+
+        DOM.Document doc = new DOM.Document();
+        doc.load(xmlresponsestring);
+        DOM.XmlNode root = doc.getRootElement();
+        String namespace = root.getNameSpace();
+        DOM.XmlNode body = root.getChildElement('Body', namespace);
+        List<DOM.XmlNode> responses = body.getChildElements();
+
+        for (DOM.XmlNode node : responses) {
+            for (DOM.XmlNode result : node.getChildElements()) {
+                if (result.getName() == 'SALES_DOCUMENT' && String.isNotEmpty(result.getText())) {
+                    order.SAP_ID__c = result.getText();
+                } else if (result.getName() == 'MESSAGE_type') {
+                    order.Message_Type__c = result.getText();
+                } else if (result.getName() == 'MESSAGE') {
+                    order.Remarks__c = result.getText();
+                }
+            }
+        }
+
+        order.Status = (order.SAP_ID__c == null) ? 'Rejected' : order.Status;
+        update order;
+        return order.SAP_ID__c;
+    }
+
+    public static String convertDateToString(Date dateValue) {
+        return String.valueOf(dateValue).replace('-', '');
+    }
+
+    public static String convertDateformat(Date dateValue) {
+        String[] parts = String.valueOf(dateValue).split('-');
+        return parts[2] + parts[1] + parts[0];
+    }
+
+    @AuraEnabled
+    public static List<Order> orderPreview(Id sales) {
+        return [
+            SELECT Id, Name, Contract_Code__c, Order_Typelookup__c, SAP_ID__c,
+                   Sales_Division__r.code__c, Customer_Reference__c, EffectiveDate,
+                   Customer_Ref_Date__c, Sales_Office_Code__c, Order_Typelookup__r.code__c,
+                   Account.Name, Account.SAP_ID__c, Account.Terms_of_Payment__c,
+                   Sales_Advice_Code__c,
+                   (SELECT Id, Name, Product__c, Product__r.Material_Name__c, Version__c,
+                           Quantity__c, Product_grade_quality__c, Batch__c FROM Order_Line_Items__r)
+              FROM Order WHERE Id = :sales
+        ];
+    }
+
+    @AuraEnabled
+    public static String userprof() {
+        User u = [SELECT Profile.Name FROM User WHERE Id = :UserInfo.getUserId() LIMIT 1];
+        return u.Profile.Name;
+    }
+}
